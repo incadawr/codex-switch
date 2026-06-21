@@ -195,34 +195,69 @@ last=$(cat "$STATE" 2>/dev/null || echo 0)
 rec=$(( (last + 1) % N ))          # round-robin: next after last-used
 rec_name="${accounts[$rec]}"
 
-echo "Codex accounts:" >&2
-i=0
-for a in "${accounts[@]}"; do
-  marker="  "
-  [ "$i" = "$rec" ] && marker="=>"
-  note=""
-  [ "$i" = "$last" ] && note="${note}  (last used)"
-  [ "$i" = "$rec" ] && note="${note}  (recommended)"
-  printf "  %s %d) %s%s\n" "$marker" "$((i+1))" "$a" "$note" >&2
-  i=$((i+1))
-done
-
-# Manual selection reads a single keypress, so only 1-9 are pickable here.
-# With more accounts, the rest are reachable via `cx --use <name>`.
-pickmax=$N
-[ "$pickmax" -gt 9 ] && { pickmax=9; echo "  (10+ accounts: use 'cx --use <name>' for the rest)" >&2; }
-
-# Live countdown; any digit keypress selects immediately (cancels auto-select)
-sel=""
-for ((s=AUTO_SECONDS; s>=1; s--)); do
-  printf "\r  -> auto-selecting '%s' in %ds  (press 1-%d to choose)   " "$rec_name" "$s" "$pickmax" >&2
-  if read -t 1 -n1 -r key 2>/dev/null; then sel="$key"; break; fi
-done
-printf "\n" >&2
-
-choice="$rec"
-if [[ "$sel" =~ ^[0-9]$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$pickmax" ]; then
-  choice=$(( sel - 1 ))
+# --- interactive menu: arrow-key navigation with round-robin auto-select ---
+# Fallback when there is no controlling terminal (cron, piped with no tty).
+if [ ! -e /dev/tty ]; then
+  launch "$rec_name" "$@"
 fi
 
+cursor=$rec
+drawn=0
+footer=""
+
+cleanup_menu() { printf '\033[?25h' >&2; }     # restore the terminal cursor
+trap 'cleanup_menu; printf "\n" >&2; exit 130' INT
+
+draw_menu() {
+  # Redraw the list in place by jumping up over the previously drawn block.
+  [ "$drawn" = 1 ] && printf '\033[%dA' "$((N + 1))" >&2
+  drawn=1
+  local i=0 a note
+  for a in "${accounts[@]}"; do
+    note=""; [ "$i" = "$last" ] && note="  (last used)"
+    if [ "$i" = "$cursor" ]; then
+      printf '\r\033[K\033[7m> %d) %s%s \033[0m\n' "$((i + 1))" "$a" "$note" >&2
+    else
+      printf '\r\033[K  %d) %s%s\n' "$((i + 1))" "$a" "$note" >&2
+    fi
+    i=$((i + 1))
+  done
+  printf '\r\033[K%s\n' "$footer" >&2
+}
+
+echo "Codex accounts:" >&2
+printf '\033[?25l' >&2                          # hide the terminal cursor
+
+mode=auto
+remaining=$AUTO_SECONDS
+choice=$cursor
+while :; do
+  if [ "$mode" = auto ]; then
+    footer="  auto-selecting '${accounts[$cursor]}' in ${remaining}s   (↑/↓ choose, Enter confirm)"
+    draw_menu
+    if ! read -rsn1 -t 1 key </dev/tty; then
+      remaining=$((remaining - 1))
+      [ "$remaining" -le 0 ] && { choice=$cursor; break; }
+      continue
+    fi
+  else
+    footer="  ↑/↓ move • Enter select • Ctrl-C cancel"
+    draw_menu
+    read -rsn1 key </dev/tty || { choice=$cursor; break; }
+  fi
+
+  if [ "$key" = $'\033' ]; then
+    # Arrow keys arrive as ESC [ A/B; consume the remaining two bytes.
+    read -rsn2 -t 1 rest </dev/tty || rest=""
+    case "$rest" in
+      '[A') mode=manual; cursor=$(( (cursor - 1 + N) % N )) ;;
+      '[B') mode=manual; cursor=$(( (cursor + 1) % N )) ;;
+    esac
+  elif [ -z "$key" ]; then
+    choice=$cursor; break                       # Enter
+  fi
+done
+
+cleanup_menu
+trap - INT
 launch "${accounts[$choice]}" "$@"

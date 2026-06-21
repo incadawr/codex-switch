@@ -26,7 +26,7 @@ the repo and listed in `.gitignore`.
 ## Usage
 
 ```bash
-cx                  # rotate to the next account (menu + 5s auto-pick when >1 account)
+cx                  # rotate to next account (↑/↓ menu + 5s auto-pick when >1 account)
 cx --use work       # use a specific account
 cx app [name]       # launch the Codex desktop app on an account
 cx --list           # list accounts, marks the last one used
