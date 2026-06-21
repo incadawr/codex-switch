@@ -28,6 +28,7 @@ the repo and listed in `.gitignore`.
 ```bash
 cx                  # rotate to the next account (menu + 5s auto-pick when >1 account)
 cx --use work       # use a specific account
+cx app [name]       # launch the Codex desktop app on an account
 cx --list           # list accounts, marks the last one used
 cx login work       # add an account: creates its home, links config, runs codex login
 cx --help
@@ -35,6 +36,15 @@ cx --help
 
 Extra arguments go straight to `codex`, e.g. `cx exec "..."`. With one account
 the menu is skipped.
+
+## Desktop app
+
+The desktop app reads `CODEX_HOME` too, but a GUI launch from the Dock ignores
+the shell environment, so it always uses the default `~/.codex`. `cx app` works
+around that: it quits the running app and relaunches it with `CODEX_HOME` set to
+the chosen account. Because the app is single-instance, switching accounts means
+restarting it — which is what `cx app` does. Pass a name or let it pick the next
+account in rotation. macOS only.
 
 ## Adding an account
 

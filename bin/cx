@@ -9,6 +9,7 @@
 # Usage:
 #   cx [codex args...]      Pick account (menu, auto-recommends next round-robin), launch codex
 #   cx --use <name> [args]  Force a specific account
+#   cx app [name]           Launch the Codex desktop app on an account (restarts it)
 #   cx --list               List accounts
 #   cx login <name>         Create a new account home and run `codex login` into it
 #   cx --help
@@ -17,6 +18,7 @@
 #   CODEX_ACCOUNTS_ROOT     Accounts dir (default ~/.codex-accounts)
 #   CODEX_SHARED_HOME       Source of shared config/skills/rules (default ~/.codex)
 #   CX_AUTO_SECONDS         Menu auto-select countdown (default 5)
+#   CODEX_APP               Path to Codex.app (default /Applications/Codex.app)
 
 set -euo pipefail
 
@@ -63,19 +65,62 @@ bootstrap_from_default() {
   echo "cx: adopted existing ~/.codex login as account 'personal'" >&2
 }
 
+# Save the round-robin pointer to the given account's index
+record_index() {
+  local name="$1" idx=0 a
+  read_accounts
+  for a in "${accounts[@]}"; do [ "$a" = "$name" ] && break; idx=$((idx+1)); done
+  echo "$idx" > "$STATE"
+}
+
 launch() {
   # launch <name> [codex args...]
   local name="$1"; shift
   local home="$ROOT/$name"
   [ -d "$home" ] || { echo "cx: no such account '$name'" >&2; exit 1; }
-  # Record selection index for round-robin
-  local idx=0 a
-  read_accounts
-  for a in "${accounts[@]}"; do [ "$a" = "$name" ] && break; idx=$((idx+1)); done
-  echo "$idx" > "$STATE"
+  record_index "$name"
   echo "cx: using '$name'  (CODEX_HOME=$home)" >&2
   export CODEX_HOME="$home"
   exec codex "$@"
+}
+
+cmd_app() {
+  local app="${CODEX_APP:-/Applications/Codex.app}"
+  [ -d "$app" ] || { echo "cx: Codex app not found at $app (set CODEX_APP)" >&2; exit 1; }
+  local bin
+  bin="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" 2>/dev/null | head -1)"
+  [ -x "$bin" ] || { echo "cx: no executable in $app/Contents/MacOS" >&2; exit 1; }
+
+  bootstrap_from_default
+  read_accounts
+  local n=${#accounts[@]}
+  [ "$n" -gt 0 ] || { echo "cx: no accounts. Create one with: cx login <name>" >&2; exit 1; }
+
+  # Pick account: explicit name, else next in round-robin rotation
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    local last; last=$(cat "$STATE" 2>/dev/null || echo 0)
+    name="${accounts[$(( (last + 1) % n ))]}"
+  fi
+  local home="$ROOT/$name"
+  [ -d "$home" ] || { echo "cx: no such account '$name'" >&2; exit 1; }
+
+  # The app is single-instance, so a running copy must quit before relaunching
+  # with a different CODEX_HOME (GUI launches ignore the shell environment).
+  if pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1; then
+    echo "cx: quitting running Codex app..." >&2
+    osascript -e 'quit app "Codex"' >/dev/null 2>&1 || true
+    local i
+    for ((i=0; i<20; i++)); do
+      pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1 || break
+      sleep 0.25
+    done
+  fi
+
+  record_index "$name"
+  echo "cx: launching Codex app on '$name'  (CODEX_HOME=$home)" >&2
+  CODEX_HOME="$home" nohup "$bin" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
 }
 
 cmd_login() {
@@ -109,9 +154,13 @@ cmd_list() {
 # --- arg parsing ---
 case "${1:-}" in
   --help|-h)
-    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the leading comment block (everything after the shebang up to the
+    # first non-comment line), stripped of the leading "# ".
+    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
   --list|-l)
     cmd_list; exit 0 ;;
+  app)
+    shift; cmd_app "${1:-}"; exit 0 ;;
   login)
     shift; cmd_login "$@"; exit 0 ;;
   --use|-u)
