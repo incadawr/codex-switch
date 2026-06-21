@@ -87,9 +87,14 @@ launch() {
 cmd_app() {
   local app="${CODEX_APP:-/Applications/Codex.app}"
   [ -d "$app" ] || { echo "cx: Codex app not found at $app (set CODEX_APP)" >&2; exit 1; }
-  local bin
-  bin="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" 2>/dev/null | head -1)"
+  # Resolve the real launcher from Info.plist, not just the first file listed
+  local exe
+  exe=$(defaults read "$app/Contents/Info" CFBundleExecutable 2>/dev/null || true)
+  [ -n "$exe" ] || exe=$(ls "$app/Contents/MacOS" 2>/dev/null | head -1)
+  local bin="$app/Contents/MacOS/$exe"
   [ -x "$bin" ] || { echo "cx: no executable in $app/Contents/MacOS" >&2; exit 1; }
+  # App display name (for the quit command) follows CODEX_APP, not a fixed "Codex"
+  local appname; appname=$(basename "$app" .app)
 
   bootstrap_from_default
   read_accounts
@@ -108,17 +113,23 @@ cmd_app() {
   # The app is single-instance, so a running copy must quit before relaunching
   # with a different CODEX_HOME (GUI launches ignore the shell environment).
   if pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1; then
-    echo "cx: quitting running Codex app..." >&2
-    osascript -e 'quit app "Codex"' >/dev/null 2>&1 || true
+    echo "cx: quitting running $appname app..." >&2
+    osascript -e "quit app \"$appname\"" >/dev/null 2>&1 || true
     local i
-    for ((i=0; i<20; i++)); do
+    for ((i=0; i<40; i++)); do
       pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1 || break
       sleep 0.25
     done
+    # Abort rather than launch a second instance the OS would ignore
+    if pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1; then
+      echo "cx: $appname did not quit; aborting so it isn't left on the wrong account." >&2
+      echo "cx: quit it manually, then re-run 'cx app $name'." >&2
+      exit 1
+    fi
   fi
 
   record_index "$name"
-  echo "cx: launching Codex app on '$name'  (CODEX_HOME=$home)" >&2
+  echo "cx: launching $appname on '$name'  (CODEX_HOME=$home)" >&2
   CODEX_HOME="$home" nohup "$bin" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
@@ -131,6 +142,8 @@ cmd_login() {
   link_shared "$home"
   echo "cx: logging into account '$name' (CODEX_HOME=$home)..." >&2
   CODEX_HOME="$home" codex login
+  # Tighten perms in case codex login wrote auth.json under a permissive umask
+  [ -f "$home/auth.json" ] && chmod 600 "$home/auth.json"
 }
 
 cmd_list() {
@@ -194,16 +207,21 @@ for a in "${accounts[@]}"; do
   i=$((i+1))
 done
 
+# Manual selection reads a single keypress, so only 1-9 are pickable here.
+# With more accounts, the rest are reachable via `cx --use <name>`.
+pickmax=$N
+[ "$pickmax" -gt 9 ] && { pickmax=9; echo "  (10+ accounts: use 'cx --use <name>' for the rest)" >&2; }
+
 # Live countdown; any digit keypress selects immediately (cancels auto-select)
 sel=""
 for ((s=AUTO_SECONDS; s>=1; s--)); do
-  printf "\r  -> auto-selecting '%s' in %ds  (press 1-%d to choose)   " "$rec_name" "$s" "$N" >&2
+  printf "\r  -> auto-selecting '%s' in %ds  (press 1-%d to choose)   " "$rec_name" "$s" "$pickmax" >&2
   if read -t 1 -n1 -r key 2>/dev/null; then sel="$key"; break; fi
 done
 printf "\n" >&2
 
 choice="$rec"
-if [[ "$sel" =~ ^[0-9]$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$N" ]; then
+if [[ "$sel" =~ ^[0-9]$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$pickmax" ]; then
   choice=$(( sel - 1 ))
 fi
 
