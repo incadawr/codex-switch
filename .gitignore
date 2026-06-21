@@ -1,0 +1,8 @@
+# Never commit accounts, auth tokens, or local state.
+# Those live in ~/.codex-accounts/ (outside this repo) — listed here only as a
+# guard in case anyone copies them in.
+.codex-accounts/
+**/auth.json
+*.sqlite
+*.sqlite-*
+.rr-state

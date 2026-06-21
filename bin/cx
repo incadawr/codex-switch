@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# cx — codex account switcher (round-robin with auto-recommend menu)
+#
+# Each account is an isolated CODEX_HOME under ~/.codex-accounts/<name>/.
+# Shared config/skills/rules are symlinked to the real ~/.codex (single source
+# of truth). Auth is per-account (auth.json lives inside each home), so token
+# refresh never races between accounts.
+#
+# Usage:
+#   cx [codex args...]      Pick account (menu, auto-recommends next round-robin), launch codex
+#   cx --use <name> [args]  Force a specific account
+#   cx --list               List accounts
+#   cx login <name>         Create a new account home and run `codex login` into it
+#   cx --help
+#
+# Env:
+#   CODEX_ACCOUNTS_ROOT     Accounts dir (default ~/.codex-accounts)
+#   CODEX_SHARED_HOME       Source of shared config/skills/rules (default ~/.codex)
+#   CX_AUTO_SECONDS         Menu auto-select countdown (default 5)
+
+set -euo pipefail
+
+ROOT="${CODEX_ACCOUNTS_ROOT:-$HOME/.codex-accounts}"
+SHARED="${CODEX_SHARED_HOME:-$HOME/.codex}"   # source of truth for shared config/skills/rules
+STATE="$ROOT/.rr-state"                        # holds index of last-used account
+AUTO_SECONDS="${CX_AUTO_SECONDS:-5}"
+SHARED_ITEMS="config.toml skills rules"
+
+mkdir -p "$ROOT"
+[ -f "$STATE" ] || echo 0 > "$STATE"
+
+# Sorted list of account names (immediate subdirs, skipping dotfiles)
+list_accounts() {
+  find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort
+}
+
+# Populate global `accounts` array (bash 3.2 has no mapfile)
+read_accounts() {
+  accounts=()
+  local a
+  while IFS= read -r a; do accounts+=("$a"); done < <(list_accounts)
+}
+
+link_shared() {
+  # link_shared <account_home> — symlink shared config into an account home
+  local home="$1" item
+  for item in $SHARED_ITEMS; do
+    [ -e "$SHARED/$item" ] && ln -sfn "$SHARED/$item" "$home/$item"
+  done
+}
+
+# First-run bootstrap: if there are no accounts yet but a logged-in ~/.codex
+# exists, adopt it as the `personal` account so cx works out of the box.
+bootstrap_from_default() {
+  [ -z "$(list_accounts)" ] || return 0
+  [ -f "$SHARED/auth.json" ] || return 0
+  local home="$ROOT/personal"
+  mkdir -p "$home"
+  cp -p "$SHARED/auth.json" "$home/auth.json"
+  chmod 600 "$home/auth.json"
+  link_shared "$home"
+  echo 0 > "$STATE"
+  echo "cx: adopted existing ~/.codex login as account 'personal'" >&2
+}
+
+launch() {
+  # launch <name> [codex args...]
+  local name="$1"; shift
+  local home="$ROOT/$name"
+  [ -d "$home" ] || { echo "cx: no such account '$name'" >&2; exit 1; }
+  # Record selection index for round-robin
+  local idx=0 a
+  read_accounts
+  for a in "${accounts[@]}"; do [ "$a" = "$name" ] && break; idx=$((idx+1)); done
+  echo "$idx" > "$STATE"
+  echo "cx: using '$name'  (CODEX_HOME=$home)" >&2
+  export CODEX_HOME="$home"
+  exec codex "$@"
+}
+
+cmd_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || { echo "cx: usage: cx login <name>" >&2; exit 1; }
+  local home="$ROOT/$name"
+  mkdir -p "$home"
+  link_shared "$home"
+  echo "cx: logging into account '$name' (CODEX_HOME=$home)..." >&2
+  CODEX_HOME="$home" codex login
+}
+
+cmd_list() {
+  bootstrap_from_default
+  local last cur=0 a
+  read_accounts
+  last=$(cat "$STATE" 2>/dev/null || echo 0)
+  if [ "${#accounts[@]}" -eq 0 ]; then
+    echo "cx: no accounts yet. Create one with: cx login <name>"
+    return 0
+  fi
+  echo "Codex accounts ($ROOT):"
+  for a in "${accounts[@]}"; do
+    local tag=""
+    [ "$cur" = "$last" ] && tag="  <- last used"
+    printf "  %d) %s%s\n" "$((cur+1))" "$a" "$tag"
+    cur=$((cur+1))
+  done
+}
+
+# --- arg parsing ---
+case "${1:-}" in
+  --help|-h)
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --list|-l)
+    cmd_list; exit 0 ;;
+  login)
+    shift; cmd_login "$@"; exit 0 ;;
+  --use|-u)
+    name="${2:-}"; [ -n "$name" ] || { echo "cx: --use needs a name" >&2; exit 1; }
+    shift 2; launch "$name" "$@"; exit 0 ;;
+esac
+
+# --- default: menu with round-robin recommendation + auto-select ---
+bootstrap_from_default
+read_accounts
+N=${#accounts[@]}
+[ "$N" -gt 0 ] || { echo "cx: no accounts. Create one with: cx login <name>" >&2; exit 1; }
+
+if [ "$N" -eq 1 ]; then
+  launch "${accounts[0]}" "$@"
+fi
+
+last=$(cat "$STATE" 2>/dev/null || echo 0)
+rec=$(( (last + 1) % N ))          # round-robin: next after last-used
+rec_name="${accounts[$rec]}"
+
+echo "Codex accounts:" >&2
+i=0
+for a in "${accounts[@]}"; do
+  marker="  "
+  [ "$i" = "$rec" ] && marker="=>"
+  note=""
+  [ "$i" = "$last" ] && note="${note}  (last used)"
+  [ "$i" = "$rec" ] && note="${note}  (recommended)"
+  printf "  %s %d) %s%s\n" "$marker" "$((i+1))" "$a" "$note" >&2
+  i=$((i+1))
+done
+
+# Live countdown; any digit keypress selects immediately (cancels auto-select)
+sel=""
+for ((s=AUTO_SECONDS; s>=1; s--)); do
+  printf "\r  -> auto-selecting '%s' in %ds  (press 1-%d to choose)   " "$rec_name" "$s" "$N" >&2
+  if read -t 1 -n1 -r key 2>/dev/null; then sel="$key"; break; fi
+done
+printf "\n" >&2
+
+choice="$rec"
+if [[ "$sel" =~ ^[0-9]$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$N" ]; then
+  choice=$(( sel - 1 ))
+fi
+
+launch "${accounts[$choice]}" "$@"
