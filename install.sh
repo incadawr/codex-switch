@@ -33,18 +33,15 @@ if ! on_path "$INSTALL_DIR"; then
 fi
 
 # Bootstrap first account from an existing logged-in ~/.codex, if present.
+# personal is a symlink to ~/.codex (not a copy), so it shares one auth.json and
+# never drifts when bare codex / the app refresh the token. -L so an existing
+# symlinked home counts as a dir.
 mkdir -p "$ROOT"
 [ -f "$ROOT/.rr-state" ] || echo 0 > "$ROOT/.rr-state"
-if [ -z "$(find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null)" ]; then
+if [ -z "$(find -L "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' 2>/dev/null)" ]; then
   if [ -f "$SHARED/auth.json" ]; then
-    home="$ROOT/personal"
-    mkdir -p "$home"
-    cp -p "$SHARED/auth.json" "$home/auth.json"
-    chmod 600 "$home/auth.json"
-    for item in config.toml skills rules; do
-      [ -e "$SHARED/$item" ] && ln -sfn "$SHARED/$item" "$home/$item"
-    done
-    echo "install: adopted existing $SHARED login as account 'personal'"
+    ln -sfn "$SHARED" "$ROOT/personal"
+    echo "install: adopted existing $SHARED login as account 'personal' (symlink)"
   else
     echo "install: no existing $SHARED/auth.json — create your first account with: cx login <name>"
   fi

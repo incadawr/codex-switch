@@ -2,38 +2,45 @@
 # cx — codex account switcher (round-robin with auto-recommend menu)
 #
 # Each account is an isolated CODEX_HOME under ~/.codex-accounts/<name>/.
-# Shared config/skills/rules are symlinked to the real ~/.codex (single source
-# of truth). Auth is per-account (auth.json lives inside each home), so token
-# refresh never races between accounts.
+# Shared config/skills/rules/sessions are symlinked to the real ~/.codex
+# (single source of truth), so `codex resume`/`fork` see every account's
+# history no matter which account you're currently running as. Auth is
+# per-account (auth.json lives inside each home), so token refresh never
+# races between accounts.
 #
 # Usage:
 #   cx [codex args...]      Pick account (menu, auto-recommends next round-robin), launch codex
 #   cx --use <name> [args]  Force a specific account
 #   cx app [name]           Launch the Codex desktop app on an account (restarts it)
 #   cx --list               List accounts
-#   cx login <name>         Create a new account home and run `codex login` into it
+#   cx login <name> [args]  Create a new account home and log in.
+#                           Default: `codex login --device-auth`.
+#                           Pass codex-login args to override (e.g. --with-api-key),
+#                           or `browser` for the bare ChatGPT browser flow.
 #   cx --help
 #
 # Env:
 #   CODEX_ACCOUNTS_ROOT     Accounts dir (default ~/.codex-accounts)
-#   CODEX_SHARED_HOME       Source of shared config/skills/rules (default ~/.codex)
+#   CODEX_SHARED_HOME       Source of shared config/skills/rules/sessions (default ~/.codex)
 #   CX_AUTO_SECONDS         Menu auto-select countdown (default 5)
-#   CODEX_APP               Path to Codex.app (default /Applications/Codex.app)
+#   CODEX_APP               Path to Codex.app or ChatGPT.app (auto-detected by default)
 
 set -euo pipefail
 
 ROOT="${CODEX_ACCOUNTS_ROOT:-$HOME/.codex-accounts}"
-SHARED="${CODEX_SHARED_HOME:-$HOME/.codex}"   # source of truth for shared config/skills/rules
+SHARED="${CODEX_SHARED_HOME:-$HOME/.codex}"   # source of truth for shared config/skills/rules/sessions
 STATE="$ROOT/.rr-state"                        # holds index of last-used account
 AUTO_SECONDS="${CX_AUTO_SECONDS:-5}"
-SHARED_ITEMS="config.toml skills rules"
+SHARED_ITEMS="config.toml skills rules sessions"
 
 mkdir -p "$ROOT"
 [ -f "$STATE" ] || echo 0 > "$STATE"
 
-# Sorted list of account names (immediate subdirs, skipping dotfiles)
+# Sorted list of account names (immediate subdirs, skipping dotfiles).
+# -L follows symlinks so a symlinked home (e.g. personal -> ~/.codex) counts as
+# a dir; dangling symlinks are skipped.
 list_accounts() {
-  find "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort
+  find -L "$ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; | sort
 }
 
 # Populate global `accounts` array (bash 3.2 has no mapfile)
@@ -44,25 +51,61 @@ read_accounts() {
 }
 
 link_shared() {
-  # link_shared <account_home> — symlink shared config into an account home
-  local home="$1" item
+  # link_shared <account_home> — symlink shared config into an account home.
+  # Skip when the home IS the shared dir (e.g. personal -> ~/.codex): the items
+  # already live there, and linking would create self-referential symlinks.
+  local home="$1" item private=""
+  if [ "$(cd "$home" 2>/dev/null && pwd -P)" = "$(cd "$SHARED" 2>/dev/null && pwd -P)" ]; then
+    return 0
+  fi
+  # An account can opt an item out of sharing by listing it (space-separated)
+  # in .cx-private — e.g. a custom-endpoint account wants its own config.toml
+  # (model_provider/base_url) instead of the shared ChatGPT-account one.
+  [ -f "$home/.cx-private" ] && private=$(cat "$home/.cx-private")
   for item in $SHARED_ITEMS; do
-    [ -e "$SHARED/$item" ] && ln -sfn "$SHARED/$item" "$home/$item"
+    [ -e "$SHARED/$item" ] || continue
+    case " $private " in *" $item "*) continue ;; esac
+    # A pre-existing real dir (not yet a symlink) predates this item joining
+    # SHARED_ITEMS — e.g. per-account session history from before sessions
+    # became shared. Fold it into the shared copy first so promoting an item
+    # to shared storage never drops data.
+    if [ -d "$home/$item" ] && [ ! -L "$home/$item" ]; then
+      merge_into_shared "$home/$item" "$SHARED/$item"
+      if [ -e "$home/$item" ]; then
+        echo "cx: warning: $home/$item has leftover files (name clash with shared copy); left un-shared" >&2
+        continue
+      fi
+    fi
+    ln -sfn "$SHARED/$item" "$home/$item"
   done
+}
+
+merge_into_shared() {
+  # merge_into_shared <local_dir> <shared_dir> — move every file from a real
+  # local dir into the shared copy, preserving its relative path, then drop
+  # the emptied local dir so the caller can replace it with a symlink. Uses
+  # `mv -n` so a same-named file already in the shared copy is left alone
+  # rather than overwritten.
+  local src="$1" dst="$2" f rel
+  while IFS= read -r -d '' f; do
+    rel="${f#"$src"/}"
+    mkdir -p "$dst/$(dirname "$rel")"
+    mv -n "$f" "$dst/$rel"
+  done < <(find "$src" -type f -print0)
+  find "$src" -type d -empty -delete 2>/dev/null || true
 }
 
 # First-run bootstrap: if there are no accounts yet but a logged-in ~/.codex
 # exists, adopt it as the `personal` account so cx works out of the box.
+# personal is a *symlink* to ~/.codex (not a copy), so they share one auth.json
+# and never drift when bare codex / the app / the codex-agent skill refresh the
+# token. The shared config/skills/rules already live in ~/.codex.
 bootstrap_from_default() {
   [ -z "$(list_accounts)" ] || return 0
   [ -f "$SHARED/auth.json" ] || return 0
-  local home="$ROOT/personal"
-  mkdir -p "$home"
-  cp -p "$SHARED/auth.json" "$home/auth.json"
-  chmod 600 "$home/auth.json"
-  link_shared "$home"
+  ln -sfn "$SHARED" "$ROOT/personal"
   echo 0 > "$STATE"
-  echo "cx: adopted existing ~/.codex login as account 'personal'" >&2
+  echo "cx: adopted existing ~/.codex login as account 'personal' (symlink)" >&2
 }
 
 # Save the round-robin pointer to the given account's index
@@ -73,20 +116,410 @@ record_index() {
   echo "$idx" > "$STATE"
 }
 
+# pick_menu <title> <auto_seconds> <default_index> <tagged_index_or_-1>
+# Arrow-key menu with round-robin-style auto-select, shared by account and
+# model pickers. Reads labels from the global array `menu_items`; sets
+# `menu_choice` to the chosen index. Falls back to `default_index`
+# immediately with a single item or no controlling terminal (cron, piped).
+pick_menu() {
+  local title="$1" auto_seconds="$2" default_idx="$3" tagged_idx="${4:--1}"
+  local n=${#menu_items[@]}
+  if [ "$n" -le 1 ] || [ ! -e /dev/tty ]; then
+    menu_choice=$default_idx
+    return 0
+  fi
+
+  local cursor=$default_idx drawn=0 footer="" mode=auto remaining=$auto_seconds
+  local choice=$cursor key rest
+
+  cleanup_menu() { printf '\033[?25h' >&2; }     # restore the terminal cursor
+  trap 'cleanup_menu; printf "\n" >&2; exit 130' INT
+
+  draw_menu() {
+    # Redraw the list in place by jumping up over the previously drawn block.
+    [ "$drawn" = 1 ] && printf '\033[%dA' "$((n + 1))" >&2
+    drawn=1
+    local i=0 item note
+    for item in "${menu_items[@]}"; do
+      note=""; [ "$i" = "$tagged_idx" ] && note="  (last used)"
+      if [ "$i" = "$cursor" ]; then
+        printf '\r\033[K\033[7m> %d) %s%s \033[0m\n' "$((i + 1))" "$item" "$note" >&2
+      else
+        printf '\r\033[K  %d) %s%s\n' "$((i + 1))" "$item" "$note" >&2
+      fi
+      i=$((i + 1))
+    done
+    printf '\r\033[K%s\n' "$footer" >&2
+  }
+
+  echo "$title" >&2
+  printf '\033[?25l' >&2                          # hide the terminal cursor
+
+  while :; do
+    if [ "$mode" = auto ]; then
+      footer="  auto-selecting '${menu_items[$cursor]}' in ${remaining}s   (↑/↓ choose, Enter confirm)"
+      draw_menu
+      if ! read -rsn1 -t 1 key </dev/tty; then
+        remaining=$((remaining - 1))
+        [ "$remaining" -le 0 ] && { choice=$cursor; break; }
+        continue
+      fi
+    else
+      footer="  ↑/↓ move • Enter select • Ctrl-C cancel"
+      draw_menu
+      read -rsn1 key </dev/tty || { choice=$cursor; break; }
+    fi
+
+    if [ "$key" = $'\033' ]; then
+      # Arrow keys arrive as ESC [ A/B; consume the remaining two bytes.
+      read -rsn2 -t 1 rest </dev/tty || rest=""
+      case "$rest" in
+        '[A') mode=manual; cursor=$(( (cursor - 1 + n) % n )) ;;
+        '[B') mode=manual; cursor=$(( (cursor + 1) % n )) ;;
+      esac
+    elif [ -z "$key" ]; then
+      choice=$cursor; break                       # Enter
+    fi
+  done
+
+  cleanup_menu
+  trap - INT
+  menu_choice=$choice
+}
+
+# True if "$@" already picks a model explicitly (-m/--model or -c model=...),
+# so the account's own model menu (see .cx-models) should stay out of the way.
+args_have_model() {
+  local prev="" a
+  for a in "$@"; do
+    case "$a" in
+      -m|--model|--model=*) return 0 ;;
+    esac
+    case "$prev $a" in
+      "-c model="*) return 0 ;;
+    esac
+    prev="$a"
+  done
+  return 1
+}
+
+config_value() {
+  # config_value <config.toml> <top-level-key>
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 1
+  awk -F= -v wanted="$key" '
+    /^[[:space:]]*\[/ { exit }
+    {
+      k=$1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k != wanted) next
+      v=substr($0, index($0, "=") + 1)
+      sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+      if (v ~ /^".*"$/) { sub(/^"/, "", v); sub(/"$/, "", v) }
+      print v; exit
+    }
+  ' "$file"
+}
+
+selected_model() {
+  # selected_model <config.toml> [codex args...]
+  local config="$1"; shift
+  local prev="" a
+  for a in "$@"; do
+    if [ "$prev" = "-m" ] || [ "$prev" = "--model" ]; then printf '%s\n' "$a"; return 0; fi
+    case "$a" in --model=*) printf '%s\n' "${a#*=}"; return 0 ;; esac
+    prev="$a"
+  done
+  config_value "$config" model
+}
+
+sql_quote() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+find_rollout_by_id() {
+  # The SQLite thread index can lag behind (or disagree with) the rollout that
+  # Codex will actually load. Resolve an explicit session UUID on disk too.
+  local id="$1"
+  [ -d "$SHARED/sessions" ] || return 1
+  find -L "$SHARED/sessions" -type f -name "rollout-*-$id.jsonl" -print -quit 2>/dev/null
+}
+
+convert_session_provider() {
+  # convert_session_provider <account> <provider> <model> <session-id>
+  # Sets converted_session_id. Provider-bound reasoning ciphertext is omitted;
+  # messages and tool history remain available in the new thread.
+  local account="$1" provider="$2" model="$3" source_id="$4"
+  local db="$SHARED/state_5.sqlite" map="$ROOT/.session-conversions"
+  local existing existing_file source_file new_id stamp day out_dir out_file tmp now
+  local q_account q_provider q_model q_source q_new q_out
+  converted_session_id="$source_id"
+  [ -f "$db" ] || return 0
+  command -v jq >/dev/null 2>&1 || { echo "cx: jq is required for cross-provider resume" >&2; return 1; }
+  command -v sqlite3 >/dev/null 2>&1 || { echo "cx: sqlite3 is required for cross-provider resume" >&2; return 1; }
+  command -v uuidgen >/dev/null 2>&1 || { echo "cx: uuidgen is required for cross-provider resume" >&2; return 1; }
+
+  if [ -f "$map" ]; then
+    existing=$(awk -F '\t' -v id="$source_id" -v account="$account" \
+      '$1 == id && $2 == account { value=$3 } END { print value }' "$map")
+    if [ -n "$existing" ]; then
+      existing_file=$(find_rollout_by_id "$existing" || true)
+      if [ -n "$existing_file" ] || sqlite3 "$db" "select 1 from threads where id='$(sql_quote "$existing")' limit 1" | grep -q 1; then
+        converted_session_id="$existing"
+        return 0
+      fi
+    fi
+  fi
+
+  source_file=$(sqlite3 "$db" "select rollout_path from threads where id='$(sql_quote "$source_id")' limit 1")
+  [ -f "$source_file" ] || source_file=$(find_rollout_by_id "$source_id" || true)
+  [ -f "$source_file" ] || { echo "cx: cannot find rollout for session $source_id" >&2; return 1; }
+
+  new_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  stamp=$(date '+%Y-%m-%dT%H-%M-%S')
+  day=$(date '+%Y/%m/%d')
+  now=$(date '+%s')
+  out_dir="$SHARED/sessions/$day"
+  out_file="$out_dir/rollout-$stamp-$new_id.jsonl"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/cx-session-convert.XXXXXX")
+  mkdir -p "$out_dir"
+  jq -c --arg id "$new_id" --arg provider "$provider" --arg model "$model" '
+    select(.type != "response_item" or .payload.type != "reasoning")
+    | if .type == "session_meta" then
+        .payload.id = $id
+        | .payload.session_id = $id
+        | .payload.model_provider = $provider
+      elif .type == "turn_context" then
+        .payload.model = $model
+      elif .type == "event_msg" and .payload.type == "thread_settings_applied" then
+        .payload.thread_settings.model = $model
+        | .payload.thread_settings.model_provider_id = $provider
+      else . end
+  ' "$source_file" > "$tmp"
+  jq -e -s --arg id "$new_id" --arg provider "$provider" \
+    'length > 0 and .[0].type == "session_meta" and .[0].payload.id == $id and .[0].payload.model_provider == $provider' \
+    "$tmp" >/dev/null || { rm -f "$tmp"; echo "cx: converted rollout failed validation" >&2; return 1; }
+  mv "$tmp" "$out_file"
+  chmod 600 "$out_file"
+
+  q_account=$(sql_quote "$account"); q_provider=$(sql_quote "$provider")
+  q_model=$(sql_quote "$model"); q_source=$(sql_quote "$source_id")
+  q_new=$(sql_quote "$new_id"); q_out=$(sql_quote "$out_file")
+  sqlite3 "$db" "BEGIN IMMEDIATE;
+    INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at, git_sha, git_branch, git_origin_url, cli_version, first_user_message, agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path, created_at_ms, updated_at_ms, thread_source, preview, recency_at, recency_at_ms, history_mode)
+    SELECT '$q_new', '$q_out', $now, $now, source, '$q_provider', cwd, title || ' [$q_account]', sandbox_policy, approval_mode, 0, has_user_event, archived, archived_at, git_sha, git_branch, git_origin_url, cli_version, first_user_message, agent_nickname, agent_role, memory_mode, '$q_model', reasoning_effort, agent_path, $((now * 1000)), $((now * 1000)), thread_source, preview, $now, $((now * 1000)), history_mode
+    FROM threads WHERE id='$q_source';
+    COMMIT;"
+  printf '%s\t%s\t%s\n' "$source_id" "$account" "$new_id" >> "$map"
+  chmod 600 "$map"
+  converted_session_id="$new_id"
+  echo "cx: converted session $source_id -> $new_id (target $provider via '$account')" >&2
+}
+
+prepare_cross_provider_session() {
+  # Rewrites global prepared_args for resume/fork. With no explicit UUID, cx
+  # chooses the thread first so conversion can happen before Codex bootstrap.
+  local account="$1" home="$2"; shift 2
+  prepared_args=("$@")
+  local command_index=-1 command="" i a session_id="" source_provider target_provider model
+  local want_last=0 want_all=0
+  for ((i=0; i<${#prepared_args[@]}; i++)); do
+    case "${prepared_args[$i]}" in resume|fork) command_index=$i; command="${prepared_args[$i]}"; break ;; esac
+  done
+  [ "$command_index" -ge 0 ] || return 0
+
+  target_provider=$(config_value "$home/config.toml" model_provider 2>/dev/null || true)
+  [ -n "$target_provider" ] || target_provider="openai"
+  model=$(selected_model "$home/config.toml" "${prepared_args[@]}" 2>/dev/null || true)
+  [ -n "$model" ] || return 0
+
+  for ((i=command_index+1; i<${#prepared_args[@]}; i++)); do
+    a="${prepared_args[$i]}"
+    [ "$a" = "--last" ] && want_last=1
+    [ "$a" = "--all" ] && want_all=1
+    [[ "$a" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}$ ]] && { session_id="$a"; break; }
+  done
+  if [ -z "$session_id" ]; then
+    local db="$SHARED/state_5.sqlite" row where_cwd=""
+    [ -f "$db" ] || return 0
+    [ "$want_all" -eq 0 ] && where_cwd=" and cwd='$(sql_quote "$PWD")'"
+    if [ "$want_last" -eq 1 ]; then
+      session_id=$(sqlite3 "$db" "select id from threads where archived=0 and preview<>''$where_cwd order by recency_at_ms desc limit 1")
+    else
+      menu_items=(); session_choices=()
+      while IFS=$'\t' read -r session_id source_provider row; do
+        [ -n "$session_id" ] || continue
+        session_choices+=("$session_id")
+        menu_items+=("[$source_provider] $row")
+      done < <(sqlite3 -separator $'\t' "$db" "select id, model_provider, replace(replace(substr(title,1,90),char(10),' '),char(9),' ') from threads where archived=0 and preview<>''$where_cwd order by recency_at_ms desc limit 20")
+      [ "${#session_choices[@]}" -gt 0 ] || return 0
+      pick_menu "Session to $command:" "$AUTO_SECONDS" 0 -1
+      session_id="${session_choices[$menu_choice]}"
+    fi
+    [ -n "$session_id" ] || return 0
+    local filtered_args=()
+    for a in "${prepared_args[@]}"; do
+      [ "$a" = "--last" ] || [ "$a" = "--all" ] || filtered_args+=("$a")
+    done
+    prepared_args=("${filtered_args[@]}")
+    prepared_args+=("$session_id")
+  fi
+
+  # Trust the rollout metadata over the SQLite index: this is the provider
+  # Codex validates during bootstrap, while the index may be stale.
+  local source_file
+  source_file=$(find_rollout_by_id "$session_id" || true)
+  if [ -n "$source_file" ] && command -v jq >/dev/null 2>&1; then
+    source_provider=$(head -n 1 "$source_file" | jq -r \
+      'select(.type == "session_meta") | .payload.model_provider // empty')
+  fi
+  [ -n "$source_provider" ] || source_provider=$(sqlite3 "$SHARED/state_5.sqlite" "select model_provider from threads where id='$(sql_quote "$session_id")' limit 1")
+  [ -n "$source_provider" ] || return 0
+  if [ "$source_provider" != "$target_provider" ]; then
+    convert_session_provider "$account" "$target_provider" "$model" "$session_id"
+    for ((i=0; i<${#prepared_args[@]}; i++)); do
+      [ "${prepared_args[$i]}" = "$session_id" ] && prepared_args[$i]="$converted_session_id"
+    done
+  fi
+}
+
+snapshot_rollouts() {
+  # snapshot_rollouts <sessions_dir> <out_file>
+  local sessions="$1" out="$2"
+  if [ -d "$sessions" ]; then
+    find -L "$sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort > "$out"
+  else
+    : > "$out"
+  fi
+}
+
+latest_new_rollout() {
+  # latest_new_rollout <sessions_dir> <before_file> <cwd>
+  local sessions="$1" before="$2" cwd="$3" latest="" f
+  [ -d "$sessions" ] || return 1
+  while IFS= read -r f; do
+    grep -Fqx -- "$f" "$before" 2>/dev/null && continue
+    jq -e --arg cwd "$cwd" '
+      select(.type == "session_meta")
+      | .payload
+      | .cwd == $cwd
+        and .thread_source == "user"
+        and (.originator == "codex-tui" or .originator == "codex_exec")
+    ' "$f" >/dev/null 2>&1 || continue
+    if [ -z "$latest" ] || [ "$f" -nt "$latest" ]; then
+      latest="$f"
+    fi
+  done < <(find -L "$sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null)
+  [ -n "$latest" ] || return 1
+  printf '%s\n' "$latest"
+}
+
+print_token_cache_summary() {
+  # print_token_cache_summary <account_home> <before_file> <cwd>
+  local home="$1" before="$2" cwd="$3" file stats
+  local raw_input cached output reasoning
+  local visible_input visible_total hit_rate
+  command -v jq >/dev/null 2>&1 || return 0
+  file=$(latest_new_rollout "$home/sessions" "$before" "$cwd" 2>/dev/null || true)
+  [ -n "$file" ] || return 0
+  stats=$(jq -r '
+    select(.type == "event_msg" and .payload.type == "token_count")
+    | .payload.info.total_token_usage
+    | [
+        (.input_tokens // 0),
+        (.cached_input_tokens // 0),
+        (.output_tokens // 0),
+        (.reasoning_output_tokens // 0)
+      ]
+    | @tsv
+  ' "$file" | tail -n 1)
+  [ -n "$stats" ] || return 0
+  IFS=$'\t' read -r raw_input cached output reasoning <<< "$stats"
+  visible_input=$((raw_input - cached))
+  [ "$visible_input" -lt 0 ] && visible_input=0
+  visible_total=$((visible_input + output))
+  hit_rate=$(awk -v cached="$cached" -v raw_input="$raw_input" 'BEGIN {
+    if (raw_input > 0) printf "%.1f", (cached / raw_input) * 100;
+    else printf "0.0";
+  }')
+  printf 'cx: token cache: total=%s input=%s (+ %s cached; %s%% hit) output=%s (reasoning %s)\n' \
+    "$visible_total" "$visible_input" "$cached" "$hit_rate" "$output" "$reasoning" >&2
+}
+
 launch() {
   # launch <name> [codex args...]
   local name="$1"; shift
   local home="$ROOT/$name"
   [ -d "$home" ] || { echo "cx: no such account '$name'" >&2; exit 1; }
+  link_shared "$home"
   record_index "$name"
+
+  # An account can list its selectable models/tiers (one per line, first =
+  # default) in .cx-models — e.g. a custom-endpoint account whose models
+  # codex's own /model picker doesn't know about. Skipped if the caller
+  # already picked one explicitly.
+  if [ -f "$home/.cx-models" ] && ! args_have_model "$@"; then
+    menu_items=()
+    local line
+    while IFS= read -r line; do [ -n "$line" ] && menu_items+=("$line"); done < "$home/.cx-models"
+    if [ "${#menu_items[@]}" -gt 0 ]; then
+      pick_menu "Model for '$name':" "$AUTO_SECONDS" 0 -1
+      set -- -m "${menu_items[$menu_choice]}" "$@"
+    fi
+  fi
+
+  prepare_cross_provider_session "$name" "$home" "$@"
+  # Bash 3.2 (the macOS system Bash) reports an empty array expansion as an
+  # unbound variable under `set -u`. Plain `cx` legitimately has no Codex
+  # arguments, so avoid expanding the array in that case.
+  if [ "${#prepared_args[@]}" -gt 0 ]; then
+    set -- "${prepared_args[@]}"
+  else
+    set --
+  fi
+
   echo "cx: using '$name'  (CODEX_HOME=$home)" >&2
   export CODEX_HOME="$home"
-  exec codex "$@"
+  # Custom-endpoint accounts (see .cx-private) keep their API key out of
+  # config.toml/git in an env.sh sourced here, e.g. `export WORK_GW_API_KEY=...`.
+  # env.sh can also set CX_CODEX_BIN to run a specific codex binary instead of
+  # whatever `codex` resolves to on PATH — e.g. to skip a PATH-shadowing
+  # wrapper (SSH-tunneled proxy, etc.) for an account that shouldn't go
+  # through it, such as an internal-network endpoint.
+  [ -f "$home/env.sh" ] && . "$home/env.sh"
+  local codex_bin="${CX_CODEX_BIN:-codex}"
+  if [ -f "$home/.cx-token-cache-summary" ]; then
+    local before status
+    before=$(mktemp "${TMPDIR:-/tmp}/cx-token-cache.XXXXXX")
+    snapshot_rollouts "$home/sessions" "$before"
+    set +e
+    "$codex_bin" "$@"
+    status=$?
+    set -e
+    print_token_cache_summary "$home" "$before" "$PWD"
+    rm -f "$before"
+    exit "$status"
+  fi
+  exec "$codex_bin" "$@"
 }
 
 cmd_app() {
-  local app="${CODEX_APP:-/Applications/Codex.app}"
-  [ -d "$app" ] || { echo "cx: Codex app not found at $app (set CODEX_APP)" >&2; exit 1; }
+  local app="${CODEX_APP:-}" candidate
+  if [ -z "$app" ]; then
+    for candidate in \
+      "/Applications/Codex.app" \
+      "/Applications/ChatGPT.app" \
+      "$HOME/Applications/Codex.app" \
+      "$HOME/Applications/ChatGPT.app"; do
+      if [ -d "$candidate" ]; then
+        app="$candidate"
+        break
+      fi
+    done
+  fi
+  [ -n "$app" ] && [ -d "$app" ] || {
+    echo "cx: Codex Desktop not found (checked Codex.app and ChatGPT.app; set CODEX_APP)" >&2
+    exit 1
+  }
   # Resolve the real launcher from Info.plist, not just the first file listed
   local exe
   exe=$(defaults read "$app/Contents/Info" CFBundleExecutable 2>/dev/null || true)
@@ -109,6 +542,7 @@ cmd_app() {
   fi
   local home="$ROOT/$name"
   [ -d "$home" ] || { echo "cx: no such account '$name'" >&2; exit 1; }
+  link_shared "$home"
 
   # The app is single-instance, so a running copy must quit before relaunching
   # with a different CODEX_HOME (GUI launches ignore the shell environment).
@@ -130,18 +564,33 @@ cmd_app() {
 
   record_index "$name"
   echo "cx: launching $appname on '$name'  (CODEX_HOME=$home)" >&2
+  [ -f "$home/env.sh" ] && . "$home/env.sh"
   CODEX_HOME="$home" nohup "$bin" >/dev/null 2>&1 &
   disown 2>/dev/null || true
 }
 
 cmd_login() {
   local name="${1:-}"
-  [ -n "$name" ] || { echo "cx: usage: cx login <name>" >&2; exit 1; }
+  [ -n "$name" ] || { echo "cx: usage: cx login <name> [codex login args...]" >&2; exit 1; }
+  shift
   local home="$ROOT/$name"
   mkdir -p "$home"
   link_shared "$home"
-  echo "cx: logging into account '$name' (CODEX_HOME=$home)..." >&2
-  CODEX_HOME="$home" codex login
+  # Default to device-auth (works over SSH / headless, no local browser needed).
+  # Override by passing codex-login args verbatim (e.g. --with-api-key), or the
+  # convenience keyword `browser` for the bare ChatGPT browser flow.
+  local args=("$@")
+  if [ "${#args[@]}" -eq 0 ]; then
+    args=(--device-auth)
+  elif [ "${#args[@]}" -eq 1 ] && { [ "${args[0]}" = "browser" ] || [ "${args[0]}" = "--browser" ]; }; then
+    args=()
+  fi
+  echo "cx: logging into account '$name' (CODEX_HOME=$home): codex login ${args[*]}" >&2
+  if [ "${#args[@]}" -gt 0 ]; then
+    CODEX_HOME="$home" codex login "${args[@]}"
+  else
+    CODEX_HOME="$home" codex login
+  fi
   # Tighten perms in case codex login wrote auth.json under a permissive umask
   [ -f "$home/auth.json" ] && chmod 600 "$home/auth.json"
 }
@@ -193,71 +642,8 @@ fi
 
 last=$(cat "$STATE" 2>/dev/null || echo 0)
 rec=$(( (last + 1) % N ))          # round-robin: next after last-used
-rec_name="${accounts[$rec]}"
 
 # --- interactive menu: arrow-key navigation with round-robin auto-select ---
-# Fallback when there is no controlling terminal (cron, piped with no tty).
-if [ ! -e /dev/tty ]; then
-  launch "$rec_name" "$@"
-fi
-
-cursor=$rec
-drawn=0
-footer=""
-
-cleanup_menu() { printf '\033[?25h' >&2; }     # restore the terminal cursor
-trap 'cleanup_menu; printf "\n" >&2; exit 130' INT
-
-draw_menu() {
-  # Redraw the list in place by jumping up over the previously drawn block.
-  [ "$drawn" = 1 ] && printf '\033[%dA' "$((N + 1))" >&2
-  drawn=1
-  local i=0 a note
-  for a in "${accounts[@]}"; do
-    note=""; [ "$i" = "$last" ] && note="  (last used)"
-    if [ "$i" = "$cursor" ]; then
-      printf '\r\033[K\033[7m> %d) %s%s \033[0m\n' "$((i + 1))" "$a" "$note" >&2
-    else
-      printf '\r\033[K  %d) %s%s\n' "$((i + 1))" "$a" "$note" >&2
-    fi
-    i=$((i + 1))
-  done
-  printf '\r\033[K%s\n' "$footer" >&2
-}
-
-echo "Codex accounts:" >&2
-printf '\033[?25l' >&2                          # hide the terminal cursor
-
-mode=auto
-remaining=$AUTO_SECONDS
-choice=$cursor
-while :; do
-  if [ "$mode" = auto ]; then
-    footer="  auto-selecting '${accounts[$cursor]}' in ${remaining}s   (↑/↓ choose, Enter confirm)"
-    draw_menu
-    if ! read -rsn1 -t 1 key </dev/tty; then
-      remaining=$((remaining - 1))
-      [ "$remaining" -le 0 ] && { choice=$cursor; break; }
-      continue
-    fi
-  else
-    footer="  ↑/↓ move • Enter select • Ctrl-C cancel"
-    draw_menu
-    read -rsn1 key </dev/tty || { choice=$cursor; break; }
-  fi
-
-  if [ "$key" = $'\033' ]; then
-    # Arrow keys arrive as ESC [ A/B; consume the remaining two bytes.
-    read -rsn2 -t 1 rest </dev/tty || rest=""
-    case "$rest" in
-      '[A') mode=manual; cursor=$(( (cursor - 1 + N) % N )) ;;
-      '[B') mode=manual; cursor=$(( (cursor + 1) % N )) ;;
-    esac
-  elif [ -z "$key" ]; then
-    choice=$cursor; break                       # Enter
-  fi
-done
-
-cleanup_menu
-trap - INT
-launch "${accounts[$choice]}" "$@"
+menu_items=("${accounts[@]}")
+pick_menu "Codex accounts:" "$AUTO_SECONDS" "$rec" "$last"
+launch "${accounts[$menu_choice]}" "$@"
